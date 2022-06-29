@@ -194,11 +194,16 @@ pub enum CollatorProtocolMessage {
 	///
 	/// This should be sent before any `DistributeCollation` message.
 	CollateOn(ParaId),
-	/// Provide a collation to distribute to validators with an optional result sender.
+	/// Provide a collation to distribute in the given active leaf to validators with an optional result sender.
 	///
 	/// The result sender should be informed when at least one parachain validator seconded the collation. It is also
 	/// completely okay to just drop the sender.
-	DistributeCollation(CandidateReceipt, PoV, Option<oneshot::Sender<CollationSecondedSignal>>),
+	DistributeCollation(
+		Hash,
+		CandidateReceipt,
+		PoV,
+		Option<oneshot::Sender<CollationSecondedSignal>>,
+	),
 	/// Report a collator as having provided an invalid collation. This should lead to disconnect
 	/// and blacklist of the collator.
 	ReportCollator(CollatorId),

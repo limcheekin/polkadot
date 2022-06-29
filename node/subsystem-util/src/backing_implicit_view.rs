@@ -100,6 +100,11 @@ struct BlockInfo {
 }
 
 impl View {
+	/// Get an iterator over active leaves in the view.
+	pub fn leaves<'a>(&'a self) -> impl Iterator<Item = &'a Hash> + 'a {
+		self.leaves.keys()
+	}
+
 	/// Activate a leaf in the view.
 	/// This will request the minimum relay parents from the
 	/// Prospective Parachains subsystem for each leaf and will load headers in the ancestry of each
@@ -212,17 +217,22 @@ impl View {
 }
 
 /// Errors when fetching a leaf and associated ancestry.
-#[derive(Debug)]
+#[allow(missing_docs)]
+#[fatality::fatality]
 pub enum FetchError {
-	/// Leaf was already known.
+	#[error("Leaf was already known")]
 	AlreadyKnown,
-	/// The prospective parachains subsystem was unavailable.
+
+	#[error("The prospective parachains subsystem was unavailable")]
 	ProspectiveParachainsUnavailable,
-	/// A block header was unavailable.
+
+	#[error("A block header was unavailable")]
 	BlockHeaderUnavailable(Hash, BlockHeaderUnavailableReason),
-	/// A block header was unavailable due to a chain API error.
+
+	#[error("A block header was unavailable due to a chain API error")]
 	ChainApiError(Hash, ChainApiError),
-	/// The chain API subsystem was unavailable.
+
+	#[error("The chain API subsystem was unavailable")]
 	ChainApiUnavailable,
 }
 
