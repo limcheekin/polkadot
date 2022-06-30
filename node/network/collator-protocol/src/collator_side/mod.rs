@@ -353,12 +353,8 @@ impl State {
 		&self,
 		active_leaf: Hash,
 		candidate_relay_parent: Hash,
+		para_id: ParaId,
 	) -> Vec<PeerId> {
-		let para_id = match self.collating_on {
-			Some(para_id) => para_id,
-			None => return Vec::new(),
-		};
-
 		self.peer_views
 			.iter()
 			.filter(|(_, v)| {
@@ -384,7 +380,6 @@ async fn distribute_collation<Context>(
 	ctx: &mut Context,
 	runtime: &mut RuntimeInfo,
 	state: &mut State,
-	active_leaf: Hash,
 	id: ParaId,
 	receipt: CandidateReceipt,
 	pov: PoV,
@@ -392,6 +387,20 @@ async fn distribute_collation<Context>(
 ) -> Result<()> {
 	let candidate_relay_parent = receipt.descriptor.relay_parent;
 	let candidate_hash = receipt.hash();
+
+	let active_leaf = match state.view.get_leaf_by_ancestry(&candidate_relay_parent, Some(id)) {
+		Some(hash) => hash,
+		None => {
+			gum::debug!(
+				target: LOG_TARGET,
+				para_id = %id,
+				candidate_relay_parent = %candidate_relay_parent,
+				candidate_hash = ?candidate_hash,
+				"Candidate relay parent is not part of the implicit view",
+			);
+			return Ok(())
+		},
+	};
 
 	// TODO [now]: Figure out sanity checks.
 	// // This collation is not in the active-leaves set.
@@ -439,19 +448,20 @@ async fn distribute_collation<Context>(
 
 	// Determine which core the para collated-on is assigned to.
 	// If it is not scheduled then ignore the message.
-	let (our_core, num_cores) = match determine_core(ctx.sender(), id, active_leaf).await? {
-		Some(core) => core,
-		None => {
-			gum::warn!(
-				target: LOG_TARGET,
-				para_id = %id,
-				?active_leaf,
-				"looks like no core is assigned to {} at {}", id, active_leaf,
-			);
+	let (our_core, num_cores) =
+		match determine_core(ctx.sender(), id, candidate_relay_parent).await? {
+			Some(core) => core,
+			None => {
+				gum::warn!(
+					target: LOG_TARGET,
+					para_id = %id,
+					?active_leaf,
+					"looks like no core is assigned to {} at {}", id, candidate_relay_parent,
+				);
 
-			return Ok(())
-		},
-	};
+				return Ok(())
+			},
+		};
 
 	// Determine the group on that core.
 	let current_validators =
@@ -493,7 +503,7 @@ async fn distribute_collation<Context>(
 		Collation { receipt, pov, status: CollationStatus::Created },
 	);
 
-	let interested = state.peers_interested_in_candidate(active_leaf, candidate_relay_parent);
+	let interested = state.peers_interested_in_candidate(active_leaf, candidate_relay_parent, id);
 	// Make sure already connected peers get collations:
 	for peer_id in interested {
 		advertise_collation(ctx, state, candidate_relay_parent, peer_id).await;
@@ -679,23 +689,12 @@ async fn process_msg<Context>(
 		CollateOn(id) => {
 			state.collating_on = Some(id);
 		},
-		DistributeCollation(active_leaf, receipt, pov, result_sender) => {
+		DistributeCollation(receipt, pov, result_sender) => {
 			let _span1 = state
 				.span_per_relay_parent
 				.get(&receipt.descriptor.relay_parent)
 				.map(|s| s.child("distributing-collation"));
 			let _span2 = jaeger::Span::new(&pov, "distributing-collation");
-
-			if state.view.leaves().find(|h| **h == active_leaf).is_none() {
-				gum::debug!(
-					target: LOG_TARGET,
-					para_id = %receipt.descriptor.para_id,
-					active_leaf = %active_leaf,
-					candidate_relay_parent = %receipt.descriptor.relay_parent,
-					"DistributeCollation: active leaf is not in the view",
-				);
-				return Ok(())
-			}
 
 			match state.collating_on {
 				Some(id) if receipt.descriptor.para_id != id => {
@@ -710,17 +709,8 @@ async fn process_msg<Context>(
 				},
 				Some(id) => {
 					let _ = state.metrics.time_collation_distribution("distribute");
-					distribute_collation(
-						ctx,
-						runtime,
-						state,
-						active_leaf,
-						id,
-						receipt,
-						pov,
-						result_sender,
-					)
-					.await?;
+					distribute_collation(ctx, runtime, state, id, receipt, pov, result_sender)
+						.await?;
 				},
 				None => {
 					gum::warn!(

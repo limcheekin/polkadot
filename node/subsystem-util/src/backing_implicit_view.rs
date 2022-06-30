@@ -157,9 +157,13 @@ impl View {
 	}
 
 	/// Deactivate a leaf in the view. This prunes any outdated implicit ancestors as well.
-	pub fn deactivate_leaf(&mut self, leaf_hash: Hash) {
+	///
+	/// Returns hashes of blocks pruned from storage.
+	pub fn deactivate_leaf(&mut self, leaf_hash: Hash) -> Vec<Hash> {
+		let mut removed = Vec::new();
+
 		if self.leaves.remove(&leaf_hash).is_none() {
-			return
+			return removed
 		}
 
 		// Prune everything before the minimum out of all leaves,
@@ -170,8 +174,15 @@ impl View {
 		{
 			let minimum = self.leaves.values().map(|l| l.retain_minimum).min();
 
-			self.block_info_storage
-				.retain(|_, i| minimum.map_or(false, |m| i.block_number >= m));
+			self.block_info_storage.retain(|hash, i| {
+				let keep = minimum.map_or(false, |m| i.block_number >= m);
+				if !keep {
+					removed.push(*hash);
+				}
+				keep
+			});
+
+			removed
 		}
 	}
 
@@ -214,24 +225,47 @@ impl View {
 			.as_ref()
 			.map(|mins| mins.allowed_relay_parents_for(para_id, block_info.block_number))
 	}
+
+	/// Returns a leaf which contains this block hash in its allowed ancestry for a given
+	/// para, if any.
+	///
+	/// This can be thought as inverse to `known_allowed_relay_parents_under` when passing an
+	/// active leaf.
+	pub fn get_leaf_by_ancestry(&self, block_hash: &Hash, para_id: Option<ParaId>) -> Option<Hash> {
+		for leaf in self.leaves() {
+			if self
+				.known_allowed_relay_parents_under(leaf, para_id)
+				.unwrap_or_default()
+				.contains(block_hash)
+			{
+				return Some(*leaf)
+			}
+		}
+
+		None
+	}
 }
 
 /// Errors when fetching a leaf and associated ancestry.
-#[allow(missing_docs)]
 #[fatality::fatality]
 pub enum FetchError {
+	/// Activated leaf is already present in view.
 	#[error("Leaf was already known")]
 	AlreadyKnown,
 
+	/// Request to the prospective parachains subsystem failed.
 	#[error("The prospective parachains subsystem was unavailable")]
 	ProspectiveParachainsUnavailable,
 
+	/// Failed to fetch the block header.
 	#[error("A block header was unavailable")]
 	BlockHeaderUnavailable(Hash, BlockHeaderUnavailableReason),
 
+	/// A block header was unavailable due to a chain API error.
 	#[error("A block header was unavailable due to a chain API error")]
 	ChainApiError(Hash, ChainApiError),
 
+	/// Request to the Chain API subsystem failed.
 	#[error("The chain API subsystem was unavailable")]
 	ChainApiUnavailable,
 }
@@ -693,5 +727,38 @@ mod tests {
 		// Prune the last leaf.
 		view.deactivate_leaf(*leaf_a);
 		assert!(view.block_info_storage.is_empty());
+	}
+
+	#[test]
+	fn get_leaf_by_ancestry() {
+		let pool = TaskExecutor::new();
+		let (mut ctx, mut ctx_handle) = make_subsystem_context::<AllMessages, _>(pool);
+
+		let mut view = View::default();
+
+		// Chain B.
+		const PARA_A_MIN_PARENT: u32 = 4;
+		const PARA_B_MIN_PARENT: u32 = 3;
+
+		let prospective_response = vec![(PARA_A, PARA_A_MIN_PARENT), (PARA_B, PARA_B_MIN_PARENT)];
+
+		let leaf = CHAIN_B.last().unwrap();
+		let min_min_idx = (PARA_B_MIN_PARENT - GENESIS_NUMBER - 1) as usize;
+
+		let fut = view.activate_leaf(ctx.sender(), *leaf).timeout(TIMEOUT).map(|res| {
+			let paras = res.expect("`activate_leaf` timed out").unwrap();
+			assert_eq!(paras, vec![PARA_A, PARA_B]);
+		});
+		let overseer_fut = async {
+			assert_min_relay_parents_request(&mut ctx_handle, leaf, prospective_response).await;
+			assert_block_header_requests(&mut ctx_handle, CHAIN_B, &CHAIN_B[min_min_idx..]).await;
+		};
+		futures::executor::block_on(join(fut, overseer_fut));
+
+		assert_eq!(view.get_leaf_by_ancestry(&CHAIN_B[min_min_idx + 1], Some(PARA_A)), Some(*leaf));
+
+		assert_eq!(view.get_leaf_by_ancestry(&CHAIN_B[min_min_idx], Some(PARA_A)), None);
+
+		assert_eq!(view.get_leaf_by_ancestry(&CHAIN_B[min_min_idx], Some(PARA_B)), Some(*leaf));
 	}
 }
