@@ -42,7 +42,7 @@ use polkadot_node_subsystem::{
 		CollatorProtocolMessage, HypotheticalDepthRequest, NetworkBridgeEvent,
 		NetworkBridgeMessage, ProspectiveParachainsMessage, RuntimeApiMessage,
 	},
-	overseer, FromOrchestra, OverseerSignal, PerLeafSpan,
+	overseer, CollatorProtocolSenderTrait, FromOrchestra, OverseerSignal, PerLeafSpan,
 };
 use polkadot_node_subsystem_util::{
 	backing_implicit_view::View as ImplicitView,
@@ -950,18 +950,23 @@ async fn handle_peer_view_change<Context>(
 	let current = state.peer_views.entry(peer_id.clone()).or_default();
 	let current_leaves: HashSet<Hash> = current.leaves().copied().collect();
 
-	let added: Vec<Hash> = view.into_iter().filter(|h| !current_leaves.contains(&h)).collect();
+	let removed = current_leaves.iter().filter(|h| !view.contains(h));
+	let added: Vec<&Hash> = view.iter().filter(|h| !current_leaves.contains(h)).collect();
 
+	// Update the view and possibly advertise collations.
 	let sender = ctx.sender();
-	for hash in &added {
+	for leaf in &added {
 		current
-			.activate_leaf(sender, *hash)
+			.activate_leaf(sender, **leaf)
 			.await
 			.map_err(Error::ImplicitViewFetchError)?;
 	}
+	for leaf in removed {
+		current.deactivate_leaf(*leaf);
+	}
 
-	for hash in added {
-		advertise_collation(ctx, state, hash, peer_id.clone()).await;
+	for leaf in added {
+		advertise_collation(ctx, state, *leaf, peer_id.clone()).await;
 	}
 
 	Ok(())
@@ -1005,7 +1010,7 @@ async fn handle_network_msg<Context>(
 		},
 		OurViewChange(view) => {
 			gum::trace!(target: LOG_TARGET, ?view, "Own view change");
-			handle_our_view_change(state, view);
+			handle_our_view_change(ctx.sender(), state, view).await?;
 		},
 		PeerMessage(remote, Versioned::V1(msg)) => {
 			handle_incoming_peer_message(ctx, runtime, state, remote, msg).await?;
@@ -1019,45 +1024,65 @@ async fn handle_network_msg<Context>(
 }
 
 /// Handles our view changes.
-fn handle_our_view_change(state: &mut State, view: OurView) {
-	let new_leaves: HashSet<Hash> = view.into_iter().collect();
-	let removed_leaves = state.view.leaves().filter(|h| !new_leaves.contains(h));
+async fn handle_our_view_change<Sender>(
+	sender: &mut Sender,
+	state: &mut State,
+	view: OurView,
+) -> Result<()>
+where
+	Sender: CollatorProtocolSenderTrait,
+{
+	let current_leaves: HashSet<Hash> = state.view.leaves().copied().collect();
 
-	for removed in removed_leaves {
-		gum::debug!(target: LOG_TARGET, relay_parent = ?removed, "Removing relay parent because our view changed.");
+	let removed = current_leaves.iter().filter(|h| !view.contains(h));
+	let added = view.iter().filter(|h| !current_leaves.contains(h));
 
-		// TODO [now]: `deactivate_leaf` should return removed ancestry so that
-		// we can clean up correctly.
-		state.view.deactivate_leaf(*removed);
-
-		if let Some(collation) = state.collations.remove(removed) {
-			state.collation_result_senders.remove(&collation.receipt.hash());
-
-			match collation.status {
-				CollationStatus::Created => gum::warn!(
-					target: LOG_TARGET,
-					candidate_hash = ?collation.receipt.hash(),
-					pov_hash = ?collation.pov.hash(),
-					"Collation wasn't advertised to any validator.",
-				),
-				CollationStatus::Advertised => gum::debug!(
-					target: LOG_TARGET,
-					candidate_hash = ?collation.receipt.hash(),
-					pov_hash = ?collation.pov.hash(),
-					"Collation was advertised but not requested by any validator.",
-				),
-				CollationStatus::Requested => gum::debug!(
-					target: LOG_TARGET,
-					candidate_hash = ?collation.receipt.hash(),
-					pov_hash = ?collation.pov.hash(),
-					"Collation was requested.",
-				),
-			}
-		}
-		state.our_validators_groups.remove(removed);
-		state.span_per_relay_parent.remove(removed);
-		state.waiting_collation_fetches.remove(removed);
+	for leaf in added {
+		state
+			.view
+			.activate_leaf(sender, *leaf)
+			.await
+			.map_err(Error::ImplicitViewFetchError)?;
 	}
+
+	for leaf in removed {
+		// If the leaf is deactivated it still may stay in the view as a part
+		// of implicit ancestry. Only update the state after the hash is actually
+		// pruned from the block info storage.
+		let pruned = state.view.deactivate_leaf(*leaf);
+
+		for removed in &pruned {
+			gum::debug!(target: LOG_TARGET, relay_parent = ?removed, "Removing relay parent because our view changed.");
+			if let Some(collation) = state.collations.remove(removed) {
+				state.collation_result_senders.remove(&collation.receipt.hash());
+
+				match collation.status {
+					CollationStatus::Created => gum::warn!(
+						target: LOG_TARGET,
+						candidate_hash = ?collation.receipt.hash(),
+						pov_hash = ?collation.pov.hash(),
+						"Collation wasn't advertised to any validator.",
+					),
+					CollationStatus::Advertised => gum::debug!(
+						target: LOG_TARGET,
+						candidate_hash = ?collation.receipt.hash(),
+						pov_hash = ?collation.pov.hash(),
+						"Collation was advertised but not requested by any validator.",
+					),
+					CollationStatus::Requested => gum::debug!(
+						target: LOG_TARGET,
+						candidate_hash = ?collation.receipt.hash(),
+						pov_hash = ?collation.pov.hash(),
+						"Collation was requested.",
+					),
+				}
+			}
+			state.our_validators_groups.remove(removed);
+			state.span_per_relay_parent.remove(removed);
+			state.waiting_collation_fetches.remove(removed);
+		}
+	}
+	Ok(())
 }
 
 /// The collator protocol collator side main loop.
