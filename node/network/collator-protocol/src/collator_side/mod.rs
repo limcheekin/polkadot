@@ -40,7 +40,7 @@ use polkadot_node_subsystem::{
 	jaeger,
 	messages::{
 		CollatorProtocolMessage, HypotheticalDepthRequest, NetworkBridgeEvent,
-		NetworkBridgeMessage, ProspectiveParachainsMessage, RuntimeApiMessage,
+		NetworkBridgeMessage, ProspectiveParachainsMessage, RuntimeApiMessage, RuntimeApiRequest,
 	},
 	overseer, CollatorProtocolSenderTrait, FromOrchestra, OverseerSignal, PerLeafSpan,
 };
@@ -275,6 +275,77 @@ struct WaitingCollationFetches {
 type ActiveCollationFetches =
 	FuturesUnordered<Pin<Box<dyn Future<Output = (Hash, PeerId)> + Send + 'static>>>;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProspectiveParachainsMode {
+	// v2 runtime API: no prospective parachains.
+	Disabled,
+	// vstaging runtime API: prospective parachains.
+	Enabled,
+}
+
+impl ProspectiveParachainsMode {
+	fn is_enabled(&self) -> bool {
+		matches!(self, Self::Enabled)
+	}
+}
+
+async fn prospective_parachains_mode<Sender>(
+	sender: &mut Sender,
+	leaf_hash: Hash,
+) -> Result<ProspectiveParachainsMode>
+where
+	Sender: CollatorProtocolSenderTrait,
+{
+	// TODO: call a Runtime API once staging version is available
+	// https://github.com/paritytech/substrate/discussions/11338
+	//
+	// Implementation should be shared with backing & provisioner.
+
+	let (tx, rx) = oneshot::channel();
+	sender
+		.send_message(RuntimeApiMessage::Request(leaf_hash, RuntimeApiRequest::Version(tx)))
+		.await;
+
+	let version = rx
+		.await
+		.map_err(Error::CancelledRuntimeApiVersion)?
+		.map_err(Error::RuntimeApi)?;
+
+	if version == 3 {
+		Ok(ProspectiveParachainsMode::Enabled)
+	} else {
+		if version != 2 {
+			gum::warn!(
+				target: LOG_TARGET,
+				"Runtime API version is {}, expected 2 or 3. Prospective parachains are disabled",
+				version
+			);
+		}
+		Ok(ProspectiveParachainsMode::Disabled)
+	}
+}
+
+/// Backwards compatible (in terms of asynchronous backing) representation of
+/// peer's view.
+#[derive(Default)]
+struct PeerView {
+	/// Leaves that do support asynchronous backing along with
+	/// implicit ancestry. Leaves from the implicit view are present in
+	/// `active_leaves`, the opposite doesn't hold true.
+	///
+	/// Relay-chain blocks which don't support prospective parachains are
+	/// never included in the fragment trees of active leaves which do. In
+	/// particular, this means that if a given relay parent belongs to implicit
+	/// ancestry of some active leaf, then it does support prospective parachains.
+	implicit_view: ImplicitView,
+
+	/// All active leaves observed by the peer, including both that do and do not
+	/// support prospective parachains. This mapping works as a replacement for
+	/// [`polkadot_node_network_protocol::View`] and can be dropped once the transition
+	/// to asynchronous backing is done.
+	active_leaves: HashMap<Hash, ProspectiveParachainsMode>,
+}
+
 struct State {
 	/// Our network peer id.
 	local_peer_id: PeerId,
@@ -288,10 +359,10 @@ struct State {
 
 	/// Track all active peers and their views
 	/// to determine what is relevant to them.
-	peer_views: HashMap<PeerId, ImplicitView>,
+	peer_views: HashMap<PeerId, PeerView>,
 
 	/// Our own view.
-	view: ImplicitView,
+	view: PeerView,
 
 	/// Span per relay parent.
 	span_per_relay_parent: HashMap<Hash, PerLeafSpan>,
@@ -359,9 +430,11 @@ impl State {
 		self.peer_views
 			.iter()
 			.filter(|(_, v)| {
-				v.known_allowed_relay_parents_under(&active_leaf, Some(para_id))
-					.unwrap_or_default()
-					.contains(&candidate_relay_parent)
+				v.active_leaves.contains_key(&candidate_relay_parent) ||
+					v.implicit_view
+						.known_allowed_relay_parents_under(&active_leaf, Some(para_id))
+						.unwrap_or_default()
+						.contains(&candidate_relay_parent)
 			})
 			.map(|(peer_id, _)| *peer_id)
 			.collect()
@@ -412,21 +485,33 @@ async fn distribute_collation<Context>(
 	pov: PoV,
 	result_sender: Option<oneshot::Sender<CollationSecondedSignal>>,
 ) -> Result<()> {
+	// TODO [now]: account for the case when active leaf and candidate relay parent
+	// are from different sessions?
 	let candidate_relay_parent = receipt.descriptor.relay_parent;
 	let candidate_hash = receipt.hash();
 
-	let active_leaf = match state.view.get_leaf_by_ancestry(&candidate_relay_parent, Some(id)) {
-		Some(hash) => hash,
-		None => {
-			gum::debug!(
-				target: LOG_TARGET,
-				para_id = %id,
-				candidate_relay_parent = %candidate_relay_parent,
-				candidate_hash = ?candidate_hash,
-				"Candidate relay parent is not part of the implicit view",
-			);
-			return Ok(())
-		},
+	let (active_leaf, mode) = if let Some(prospective_parachains_mode) =
+		state.view.active_leaves.get(&candidate_relay_parent)
+	{
+		(candidate_relay_parent, *prospective_parachains_mode)
+	} else {
+		match state.view.implicit_view.get_leaf_by_ancestry(&candidate_relay_parent, Some(id)) {
+			Some(hash) => {
+				// If it's part of the implicit view then prospective
+				// parachains are enabled.
+				(hash, ProspectiveParachainsMode::Enabled)
+			},
+			None => {
+				gum::debug!(
+					target: LOG_TARGET,
+					para_id = %id,
+					candidate_relay_parent = %candidate_relay_parent,
+					candidate_hash = ?candidate_hash,
+					"Candidate relay parent is out of our view",
+				);
+				return Ok(())
+			},
+		}
 	};
 
 	// We have already seen collation for this relay parent.
@@ -441,18 +526,21 @@ async fn distribute_collation<Context>(
 
 	// Make sure there exists at least one possible tree membership for this candidate
 	// in active leaf's tree.
-	let tree_membership =
-		get_hypothetical_depth(ctx.sender(), &receipt, parent_head_data_hash, active_leaf).await?;
-	if tree_membership.is_empty() {
-		gum::debug!(
-			target: LOG_TARGET,
-			para_id = %id,
-			active_leaf = %active_leaf,
-			candidate_relay_parent = %candidate_relay_parent,
-			candidate_hash = ?candidate_hash,
-			"No possible fragment tree membership exists for candidate",
-		);
-		return Ok(())
+	if mode.is_enabled() {
+		let tree_membership =
+			get_hypothetical_depth(ctx.sender(), &receipt, parent_head_data_hash, active_leaf)
+				.await?;
+		if tree_membership.is_empty() {
+			gum::debug!(
+				target: LOG_TARGET,
+				para_id = %id,
+				active_leaf = %active_leaf,
+				candidate_relay_parent = %candidate_relay_parent,
+				candidate_hash = ?candidate_hash,
+				"No possible fragment tree membership exists for candidate",
+			);
+			return Ok(())
+		}
 	}
 
 	// Determine which core the para collated-on is assigned to.
@@ -471,6 +559,9 @@ async fn distribute_collation<Context>(
 	};
 
 	// Determine the group on that core.
+	//
+	// When prospective parachains are disabled, candidate relay parent here is
+	// guaranteed to be an active leaf.
 	let current_validators =
 		determine_our_validators(ctx, runtime, our_core, num_cores, candidate_relay_parent).await?;
 
@@ -964,7 +1055,7 @@ async fn handle_peer_view_change<Context>(
 	view: View,
 ) -> Result<()> {
 	let current = state.peer_views.entry(peer_id.clone()).or_default();
-	let current_leaves: HashSet<Hash> = current.leaves().copied().collect();
+	let current_leaves: HashSet<Hash> = current.active_leaves.keys().copied().collect();
 
 	let removed = current_leaves.iter().filter(|h| !view.contains(h));
 	let added: Vec<&Hash> = view.iter().filter(|h| !current_leaves.contains(h)).collect();
@@ -972,18 +1063,28 @@ async fn handle_peer_view_change<Context>(
 	// Update the view and possibly advertise collations.
 	let sender = ctx.sender();
 	for leaf in &added {
-		current
-			.activate_leaf(sender, **leaf)
-			.await
-			.map_err(Error::ImplicitViewFetchError)?;
+		// TODO [now]: caching.
+		let mode = prospective_parachains_mode(sender, **leaf).await?;
+
+		current.active_leaves.insert(**leaf, mode);
+
+		if mode.is_enabled() {
+			current
+				.implicit_view
+				.activate_leaf(sender, **leaf)
+				.await
+				.map_err(Error::ImplicitViewFetchError)?;
+		}
 	}
 	for leaf in removed {
-		current.deactivate_leaf(*leaf);
+		current.active_leaves.remove(leaf);
+		current.implicit_view.deactivate_leaf(*leaf);
 	}
 
-	for leaf in added {
-		advertise_collation(ctx, state, *leaf, peer_id.clone()).await;
-	}
+	// TODO [now]: update advertising based on the implicit view.
+	// for leaf in added {
+	// 	advertise_collation(ctx, state, *leaf, peer_id.clone()).await;
+	// }
 
 	Ok(())
 }
@@ -1048,24 +1149,36 @@ async fn handle_our_view_change<Sender>(
 where
 	Sender: CollatorProtocolSenderTrait,
 {
-	let current_leaves: HashSet<Hash> = state.view.leaves().copied().collect();
+	let current_leaves = state.view.active_leaves.clone();
 
-	let removed = current_leaves.iter().filter(|h| !view.contains(h));
-	let added = view.iter().filter(|h| !current_leaves.contains(h));
+	let removed = current_leaves.iter().filter(|(h, _)| !view.contains(*h));
+	let added = view.iter().filter(|h| !current_leaves.contains_key(h));
 
 	for leaf in added {
-		state
-			.view
-			.activate_leaf(sender, *leaf)
-			.await
-			.map_err(Error::ImplicitViewFetchError)?;
+		// TODO [now]: caching.
+		let mode = prospective_parachains_mode(sender, *leaf).await?;
+
+		state.view.active_leaves.insert(*leaf, mode);
+
+		if mode.is_enabled() {
+			state
+				.view
+				.implicit_view
+				.activate_leaf(sender, *leaf)
+				.await
+				.map_err(Error::ImplicitViewFetchError)?;
+		}
 	}
 
-	for leaf in removed {
+	for (leaf, mode) in removed {
 		// If the leaf is deactivated it still may stay in the view as a part
 		// of implicit ancestry. Only update the state after the hash is actually
 		// pruned from the block info storage.
-		let pruned = state.view.deactivate_leaf(*leaf);
+		let pruned = if mode.is_enabled() {
+			state.view.implicit_view.deactivate_leaf(*leaf)
+		} else {
+			vec![*leaf]
+		};
 
 		for removed in &pruned {
 			gum::debug!(target: LOG_TARGET, relay_parent = ?removed, "Removing relay parent because our view changed.");
