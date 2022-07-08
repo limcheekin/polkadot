@@ -253,6 +253,7 @@ impl CollationStatus {
 /// A collation built by the collator.
 struct Collation {
 	receipt: CandidateReceipt,
+	parent_head_data_hash: Hash,
 	pov: PoV,
 	status: CollationStatus,
 }
@@ -407,6 +408,7 @@ async fn distribute_collation<Context>(
 	state: &mut State,
 	id: ParaId,
 	receipt: CandidateReceipt,
+	parent_head_data_hash: Hash,
 	pov: PoV,
 	result_sender: Option<oneshot::Sender<CollationSecondedSignal>>,
 ) -> Result<()> {
@@ -440,7 +442,7 @@ async fn distribute_collation<Context>(
 	// Make sure there exists at least one possible tree membership for this candidate
 	// in active leaf's tree.
 	let tree_membership =
-		get_hypothetical_depth(ctx.sender(), &receipt, todo!(), active_leaf).await?;
+		get_hypothetical_depth(ctx.sender(), &receipt, parent_head_data_hash, active_leaf).await?;
 	if tree_membership.is_empty() {
 		gum::debug!(
 			target: LOG_TARGET,
@@ -505,7 +507,7 @@ async fn distribute_collation<Context>(
 
 	state.collations.insert(
 		candidate_relay_parent,
-		Collation { receipt, pov, status: CollationStatus::Created },
+		Collation { receipt, parent_head_data_hash, pov, status: CollationStatus::Created },
 	);
 
 	let interested = state.peers_interested_in_candidate(active_leaf, candidate_relay_parent, id);
@@ -694,7 +696,7 @@ async fn process_msg<Context>(
 		CollateOn(id) => {
 			state.collating_on = Some(id);
 		},
-		DistributeCollation(receipt, pov, result_sender) => {
+		DistributeCollation(receipt, parent_head_data_hash, pov, result_sender) => {
 			let _span1 = state
 				.span_per_relay_parent
 				.get(&receipt.descriptor.relay_parent)
@@ -714,8 +716,17 @@ async fn process_msg<Context>(
 				},
 				Some(id) => {
 					let _ = state.metrics.time_collation_distribution("distribute");
-					distribute_collation(ctx, runtime, state, id, receipt, pov, result_sender)
-						.await?;
+					distribute_collation(
+						ctx,
+						runtime,
+						state,
+						id,
+						receipt,
+						parent_head_data_hash,
+						pov,
+						result_sender,
+					)
+					.await?;
 				},
 				None => {
 					gum::warn!(
