@@ -367,6 +367,31 @@ impl State {
 	}
 }
 
+async fn get_hypothetical_depth<Sender>(
+	sender: &mut Sender,
+	candidate_receipt: &CandidateReceipt,
+	parent_head_data_hash: Hash,
+	active_leaf: Hash,
+) -> Result<Vec<usize>>
+where
+	Sender: CollatorProtocolSenderTrait,
+{
+	let (tx, rx) = oneshot::channel();
+
+	let request = HypotheticalDepthRequest {
+		candidate_hash: candidate_receipt.hash(),
+		candidate_para: candidate_receipt.descriptor.para_id,
+		parent_head_data_hash,
+		candidate_relay_parent: candidate_receipt.descriptor.relay_parent,
+		fragment_tree_relay_parent: active_leaf,
+	};
+
+	sender
+		.send_message(ProspectiveParachainsMessage::GetHypotheticalDepth(request, tx))
+		.await;
+	rx.await.map_err(Error::CancelledGetHypotheticalDepth)
+}
+
 /// Distribute a collation.
 ///
 /// Figure out the core our para is assigned to and the relevant validators.
@@ -402,40 +427,6 @@ async fn distribute_collation<Context>(
 		},
 	};
 
-	// TODO [now]: Figure out sanity checks.
-	// // This collation is not in the active-leaves set.
-	// if !state.view.contains(&candidate_relay_parent) {
-	// 	gum::warn!(
-	// 		target: LOG_TARGET,
-	// 		?candidate_relay_parent,
-	// 		"distribute collation message parent is outside of our view",
-	// 	);
-
-	// 	return Ok(())
-	// }
-	let (tx, rx) = oneshot::channel();
-	let request = HypotheticalDepthRequest {
-		candidate_hash,
-		candidate_para: id,
-		parent_head_data_hash: todo!(),
-		candidate_relay_parent,
-		fragment_tree_relay_parent: active_leaf,
-	};
-	ctx.send_message(ProspectiveParachainsMessage::GetHypotheticalDepth(request, tx))
-		.await;
-	let depths = rx.await.map_err(Error::CancelledGetHypotheticalDepth)?;
-	if depths.is_empty() {
-		gum::debug!(
-			target: LOG_TARGET,
-			para_id = %id,
-			active_leaf = %active_leaf,
-			candidate_relay_parent = %candidate_relay_parent,
-			candidate_hash = ?candidate_hash,
-			"No possible membership in fragment tree exists for candidate",
-		);
-		return Ok(())
-	}
-
 	// We have already seen collation for this relay parent.
 	if state.collations.contains_key(&candidate_relay_parent) {
 		gum::debug!(
@@ -446,26 +437,40 @@ async fn distribute_collation<Context>(
 		return Ok(())
 	}
 
+	// Make sure there exists at least one possible tree membership for this candidate
+	// in active leaf's tree.
+	let tree_membership =
+		get_hypothetical_depth(ctx.sender(), &receipt, todo!(), active_leaf).await?;
+	if tree_membership.is_empty() {
+		gum::debug!(
+			target: LOG_TARGET,
+			para_id = %id,
+			active_leaf = %active_leaf,
+			candidate_relay_parent = %candidate_relay_parent,
+			candidate_hash = ?candidate_hash,
+			"No possible fragment tree membership exists for candidate",
+		);
+		return Ok(())
+	}
+
 	// Determine which core the para collated-on is assigned to.
 	// If it is not scheduled then ignore the message.
-	let (our_core, num_cores) =
-		match determine_core(ctx.sender(), id, candidate_relay_parent).await? {
-			Some(core) => core,
-			None => {
-				gum::warn!(
-					target: LOG_TARGET,
-					para_id = %id,
-					?active_leaf,
-					"looks like no core is assigned to {} at {}", id, candidate_relay_parent,
-				);
+	let (our_core, num_cores) = match determine_core(ctx.sender(), id, active_leaf).await? {
+		Some(core) => core,
+		None => {
+			gum::warn!(
+				target: LOG_TARGET,
+				para_id = %id,
+				"looks like no core is assigned to {} at {}", id, active_leaf,
+			);
 
-				return Ok(())
-			},
-		};
+			return Ok(())
+		},
+	};
 
 	// Determine the group on that core.
 	let current_validators =
-		determine_our_validators(ctx, runtime, our_core, num_cores, active_leaf).await?;
+		determine_our_validators(ctx, runtime, our_core, num_cores, candidate_relay_parent).await?;
 
 	if current_validators.validators.is_empty() {
 		gum::warn!(
