@@ -34,9 +34,9 @@ jobs:
           rustup update stable
           rustup target add wasm32-unknown-unknown --toolchain nightly
       
-      - name: Test
-        run: |
-          cargo +nightly test
+#      - name: Test
+#       run: |
+#          cargo +nightly test
 
       - name: Build
         run: |
