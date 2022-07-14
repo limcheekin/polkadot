@@ -17,6 +17,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use frame_support::{
+	runtime_print,
 	dispatch::{Dispatchable, Weight},
 	ensure,
 	weights::GetDispatchInfo,
@@ -270,7 +271,11 @@ impl<Config: config::Config> XcmExecutor<Config> {
 
 	/// Process a single XCM instruction, mutating the state of the XCM virtual machine.
 	fn process_instruction(&mut self, instr: Instruction<Config::Call>) -> Result<(), XcmError> {
-		match instr {
+		runtime_print!("instruction: {:?}", instr);
+        runtime_print!("origin: {:?}", self.origin);
+        runtime_print!("holding before: {:?}", self.holding);
+
+		let result = match instr {
 			WithdrawAsset(assets) => {
 				// Take `assets` from the origin account (on-chain) and place in holding.
 				let origin = self.origin.as_ref().ok_or(XcmError::BadOrigin)?;
@@ -505,7 +510,9 @@ impl<Config: config::Config> XcmExecutor<Config> {
 			HrmpNewChannelOpenRequest { .. } => Err(XcmError::Unimplemented),
 			HrmpChannelAccepted { .. } => Err(XcmError::Unimplemented),
 			HrmpChannelClosing { .. } => Err(XcmError::Unimplemented),
-		}
+		};
+		runtime_print!("holding after: {:?}", self.holding);
+		result
 	}
 
 	/// NOTE: Any assets which were unable to be reanchored are introduced into `failed_bin`.
