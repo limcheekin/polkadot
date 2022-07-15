@@ -11081,6 +11081,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13a4ec180a2de59b57434704ccfad967f789b12737738798fa08798cd5824c16"
 
 [[package]]
+name = "test-log"
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4235dbf7ea878b3ef12dea20a59c134b405a66aafc4fc2c7b9935916e289e735"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "test-parachain-adder"
 version = "0.9.26"
 dependencies = [
@@ -11728,9 +11739,9 @@ version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
- "cfg-if 0.1.10",
+ "cfg-if 1.0.0",
  "digest 0.10.3",
- "rand 0.7.3",
+ "rand 0.8.5",
  "static_assertions",
 ]
 
@@ -12713,6 +12724,7 @@ dependencies = [
 name = "xcm-simulator-example"
 version = "0.9.26"
 dependencies = [
+ "env_logger 0.9.0",
  "frame-support",
  "frame-system",
  "pallet-balances",
@@ -12726,6 +12738,7 @@ dependencies = [
  "sp-io",
  "sp-runtime",
  "sp-std",
+ "test-log",
  "xcm",
  "xcm-builder",
  "xcm-executor",

@@ -17,7 +17,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use frame_support::{
-	runtime_print,
 	dispatch::{Dispatchable, Weight},
 	ensure,
 	weights::GetDispatchInfo,
@@ -271,9 +270,9 @@ impl<Config: config::Config> XcmExecutor<Config> {
 
 	/// Process a single XCM instruction, mutating the state of the XCM virtual machine.
 	fn process_instruction(&mut self, instr: Instruction<Config::Call>) -> Result<(), XcmError> {
-		runtime_print!("instruction: {:?}", instr);
-        runtime_print!("origin: {:?}", self.origin);
-        runtime_print!("holding before: {:?}", self.holding);
+		log::debug!("instruction: {:?}", instr);
+		log::debug!("origin: {:?}", self.origin);
+		log::debug!("holding before: {:?}", self.holding);
 
 		let result = match instr {
 			WithdrawAsset(assets) => {
@@ -511,7 +510,7 @@ impl<Config: config::Config> XcmExecutor<Config> {
 			HrmpChannelAccepted { .. } => Err(XcmError::Unimplemented),
 			HrmpChannelClosing { .. } => Err(XcmError::Unimplemented),
 		};
-		runtime_print!("holding after: {:?}", self.holding);
+		log::debug!("holding after: {:?}", self.holding);
 		result
 	}
 

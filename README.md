@@ -226,6 +226,19 @@ polkadot --dev
 You can muck around by heading to <https://polkadot.js.org/apps> and choose "Local Node" from the
 Settings menu.
 
+### XCM
+Running all tests of the `xcm-simulator-example` with the following command:
+```bash
+RUST_LOG=debug cargo test -p xcm-simulator-example -- --nocapture
+```
+
+Running a specific test of the  `xcm-simulator-example` with the following command:
+```bash
+RUST_LOG=debug cargo test -p xcm-simulator-example tests::withdraw_and_deposit -- --nocapture
+```
+
+Updated the test codes with the proposed solution of the following post at https://stackoverflow.com/questions/67087597/is-it-possible-to-use-rusts-log-info-for-tests to show the logs on console.
+
 ### Local Two-node Testnet
 
 If you want to see the multi-node consensus algorithm in action locally, then you can create a

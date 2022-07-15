@@ -114,7 +114,7 @@ mod tests {
 		BuyExecution { fees: fees.into(), weight_limit: Unlimited }
 	}
 
-	#[test]
+	#[test_log::test]
 	fn dmp() {
 		MockNet::reset();
 
@@ -142,7 +142,7 @@ mod tests {
 		});
 	}
 
-	#[test]
+	#[test_log::test]
 	fn ump() {
 		MockNet::reset();
 
@@ -169,7 +169,7 @@ mod tests {
 		});
 	}
 
-	#[test]
+	#[test_log::test]
 	fn xcmp() {
 		MockNet::reset();
 
@@ -197,7 +197,7 @@ mod tests {
 		});
 	}
 
-	#[test]
+	#[test_log::test]
 	fn reserve_transfer() {
 		MockNet::reset();
 
@@ -230,7 +230,7 @@ mod tests {
 	/// A parachain transfers funds on the relay chain to another parachain account.
 	///
 	/// Asserts that the parachain accounts are updated as expected.
-	#[test]
+	#[test_log::test] // Automatically wraps test to initialize logging
 	fn withdraw_and_deposit() {
 		MockNet::reset();
 
@@ -264,7 +264,7 @@ mod tests {
 	/// It sends a `QueryHolding` after the deposit to get notified on success.
 	///
 	/// Asserts that the balances are updated correctly and the expected XCM is sent.
-	#[test]
+	#[test_log::test]
 	fn query_holding() {
 		MockNet::reset();
 
